@@ -25,7 +25,7 @@
 ## 📁 项目结构
 
 ```
-test_playbook/
+autoRun/
 ├── playbook.py              # 主程序入口
 ├── requirements.txt         # Python依赖
 ├── config/                  # 配置文件（实际使用的配置，不提交到git）
@@ -42,6 +42,21 @@ test_playbook/
 │   │   ├── defaults.yaml   # 全局默认配置模板
 │   │   └── scenarios/      # 场景模板目录
 │   └── README.md           # 模板使用说明
+├── benchmark/               # 独立的LLM性能基准测试工具（打包为benchmark命令）
+│   ├── benchmark/          # 基准测试核心包
+│   │   ├── main.py         # 命令行入口
+│   │   ├── cli.py          # 参数解析
+│   │   ├── runner.py       # 测试调度与执行（静态/动态/自动批量）
+│   │   ├── requester.py    # 异步请求客户端
+│   │   ├── metrics.py      # 性能指标计算（TTFT/TPOT/ITL等）
+│   │   ├── models.py       # 数据模型
+│   │   └── opt.py          # SLO/精度寻优逻辑
+│   ├── convert_sharegpt_to_filtered.py # ShareGPT→filtered数据集转换工具
+│   ├── setup.py            # wheel打包配置（entry point: benchmark）
+│   ├── Dockerfile          # 基准测试镜像（数据集需外部挂载）
+│   ├── Makefile            # build/clean快捷命令
+│   └── README.md           # 基准测试工具使用说明
+├── Dockerfile               # Playbook主程序镜像
 ├── src/                     # 源代码
 │   ├── playbook/           # 核心模块
 │   │   ├── core.py         # 核心控制器
@@ -87,14 +102,14 @@ pip install -r requirements.txt
 #### Docker容器部署
 ```bash
 # 构建镜像
-docker build -t test-playbook .
+docker build -t autoRun .
 
 # 运行容器
 docker run -it --rm \
   -v $(pwd)/config:/workspace/playbook/config \
   -v $(pwd)/results:/workspace/playbook/results \
   -e NODE1_PASSWORD="your_password" \
-  test-playbook status
+  autoRun status
 ```
 
 **主要依赖包说明：**
@@ -410,6 +425,78 @@ docker run --rm \
   your-test-image \
   --scenario "$SCENARIO_NAME" \
   --output-dir "/benchmark/results"
+```
+
+## 🏎️ Benchmark 性能测试工具
+
+`benchmark/` 目录是一个**独立的 LLM 推理性能基准测试工具**，与 Playbook 编排框架解耦：Playbook 负责"在哪些节点、按什么顺序部署并跑测试"，而 `benchmark` 工具负责"对推理服务施加真实压测负载并采集性能指标"。两者通过测试脚本（`run_test.sh`）中的容器调用衔接——Playbook 部署好推理服务后，测试脚本启动 `benchmark` 容器对其发压。
+
+> 详细参数说明见 [benchmark/README.md](benchmark/README.md)。
+
+### 核心能力
+
+- **多种测试模式**:
+  - **静态模式 (`filtered`)**: 使用固定输入/输出长度，遍历并发档位测出满足 SLO 的性能峰值
+  - **动态模式 (`sharegpt`)**: 基于真实 ShareGPT 对话数据集发压，更贴近线上流量
+  - **自动寻批 (`--enable-auto-batch`)**: 稀疏+稠密两阶段采样，自动定位最优并发/批量大小
+- **SLO 驱动停止**: 通过 `--goodput` 设定服务目标、`--stop-slo` 设定停止阈值，达到 SLO 即停止遍历
+- **丰富的性能指标**: TTFT / TPOT / ITL / E2EL / 吞吐量，支持 P90/P95/P99 分位数统计
+- **结果导出**: 支持导出为 Excel 和数据库记录，便于横向对比不同配置
+
+### 构建与安装
+
+#### 方式一：本地 wheel 安装
+
+```bash
+cd benchmark
+python setup.py bdist_wheel          # 或: make build
+pip install dist/benchmark-0.0.7-py3-none-any.whl
+```
+
+安装后可直接使用 `benchmark` 命令。
+
+#### 方式二：Docker 镜像
+
+```bash
+cd benchmark
+docker build -t benchmark:v0.1 .
+```
+
+> ⚠️ **数据集需外部挂载**: 为减小镜像体积，测试数据集**不再打包进镜像**，需在运行时通过 `-v` 挂载到容器的 `/workspace/dataset`：
+>
+> ```bash
+> docker run -it --rm --network=host --ipc=host --privileged=true \
+>   -v /home/data/dataset:/workspace/dataset \
+>   -v /home/data/result:/workspace/result \
+>   benchmark:v0.1 \
+>   benchmark --model /data/Qwen3-235B --base-url http://127.0.0.1:30007 ...
+> ```
+
+### 使用示例
+
+```bash
+# 静态模式：遍历并发档位，测出满足 SLO 的性能峰值
+benchmark --model /data/Qwen3-235B-A22B-Instruct-2507-FP8 \
+  --base-url http://127.0.0.1:30007 \
+  --result-dir /workspace/result --result-dirname "default_params" \
+  --dataset-path /workspace/dataset/filtered.json --dataset-name filtered \
+  --max-concurrency 1,2,4,8 --input-len 1024 --output-len 1024 \
+  --goodput '{"mean_TTFT":10000, "mean_TPOT":100}' \
+  --stop-slo '{"mean_TTFT":15000, "mean_TPOT":150}' \
+  --metadata arch=x86 gpu="NVIDIA H20" gpu_num=4 backend=sglang
+```
+
+更多模式（动态、自动寻批、Docker 运行）的完整示例见 [benchmark/README.md](benchmark/README.md)。
+
+### 数据集转换工具
+
+`convert_sharegpt_to_filtered.py` 用于将原始 ShareGPT 数据集转换为静态模式所需的 `filtered` 格式（按 token 长度分组采样）：
+
+```bash
+python benchmark/convert_sharegpt_to_filtered.py \
+  --sharegpt-path /data/dataset/ShareGPT_V3_unfiltered_cleaned_split1.json \
+  --output-path /data/dataset/filtered/filtered_from_sharegpt.json \
+  --tokenizer-path /data/model/qwen2.5-32
 ```
 
 ## 📊 测试结果

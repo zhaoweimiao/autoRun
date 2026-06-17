@@ -25,7 +25,7 @@
 ## 📁 项目结构
 
 ```
-autoRun/
+playbook/
 ├── playbook.py              # 主程序入口
 ├── requirements.txt         # Python依赖
 ├── config/                  # 配置文件（实际使用的配置，不提交到git）
@@ -102,15 +102,27 @@ pip install -r requirements.txt
 #### Docker容器部署
 ```bash
 # 构建镜像
-docker build -t autoRun .
+docker build -t playbook .
 
 # 运行容器
 docker run -it --rm \
   -v $(pwd)/config:/workspace/playbook/config \
   -v $(pwd)/results:/workspace/playbook/results \
   -e NODE1_PASSWORD="your_password" \
-  autoRun status
+  playbook status
+
+# —— 以下挂载仅在 run_test.sh 于容器内直接执行 benchmark 时才需要 ——
+# -v /data/dataset:/workspace/dataset      # 数据集（静态/动态模式均需要）
+# -v /data/model/qwen:/workspace/model     # tokenizer 目录（仅动态 sharegpt 模式需要，--tokenizer-path 指向此处）
 ```
+
+> 📦 **镜像已内置 benchmark 工具**: 构建时会执行 `pip install ./benchmark`，因此 `benchmark` 命令在容器内可直接调用，场景测试脚本（`run_test.sh`）无需额外安装即可在 playbook 容器中执行性能测试。
+>
+> ⚠️ **数据集需外部挂载**: 测试数据集不打包进镜像，需通过 `-v /data/dataset:/workspace/dataset` 将数据集挂载到容器（路径按实际场景配置调整）。若场景以 `test_execution.node: local` 在 playbook 容器内执行测试，此挂载是必需的。
+>
+> 🔤 **关于 tokenizer**: tokenizer 通常随模型一起下载、就在模型目录中，benchmark 只需读取其中的 tokenizer 文件（不需要模型权重）。它仅在**动态(sharegpt)模式**下必需——用于分词和构造动态 prompt；**静态(filtered)模式不需要**。因此 `--tokenizer-path` 指向哪里，就要保证该路径在容器内可访问：可单独挂载模型/tokenizer 目录（如 `-v /data/model/qwen:/workspace/model`，再用 `--tokenizer-path /workspace/model`），无需把 tokenizer 拷进数据集目录。
+>
+> 💡 **是否需要挂数据集/tokenizer，取决于 `run_test.sh` 是否直接使用 `benchmark` 命令**: 如果场景的测试脚本在 playbook 容器内直接调用 `benchmark`，则需按所用模式挂载对应资源（数据集；动态模式额外挂 tokenizer 目录）；如果脚本只是远程触发其他节点上的测试、或通过 `docker run` 启动独立的 benchmark 容器（资源挂给那个容器），则 playbook 容器本身**无需**挂载，可省略上面的 `-v /data/dataset:/workspace/dataset`。
 
 **主要依赖包说明：**
 - `paramiko`: SSH连接和文件传输
